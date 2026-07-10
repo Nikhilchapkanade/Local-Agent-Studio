@@ -4,11 +4,13 @@ import type {
   RunEvent,
   RunNodeState,
   RunRecord,
+  SuspendedState,
   WorkflowDefinition,
   WorkflowEdge,
   WorkflowNode,
 } from "@agent-studio/shared";
-import { createChatModelAdapter } from "./providers";
+import vm from "vm";
+import { createChatModelAdapter, type ChatMessage } from "./providers";
 
 type ExecutionDependencies = {
   workflow: WorkflowDefinition;
@@ -17,6 +19,9 @@ type ExecutionDependencies = {
   runId: string;
   input: Record<string, string>;
   onEvent: (event: RunEvent) => Promise<void> | void;
+  approvedNodeIds?: string[];
+  suspendedState?: SuspendedState;
+  previousNodes?: RunNodeState[];
 };
 
 type ExecutionContext = {
@@ -65,33 +70,30 @@ function buildMaps(workflow: WorkflowDefinition) {
   return { nodesById, incoming, outgoing };
 }
 
-function validateDag(workflow: WorkflowDefinition) {
+function validateGraph(workflow: WorkflowDefinition) {
   const { incoming, outgoing } = buildMaps(workflow);
-  const inDegree = new Map<string, number>();
-  const queue: string[] = [];
-  for (const node of workflow.nodes) {
-    const degree = incoming.get(node.id)?.length ?? 0;
-    inDegree.set(node.id, degree);
-    if (degree === 0) {
-      queue.push(node.id);
-    }
+  const startNodes = workflow.nodes.filter(
+    (node) => (incoming.get(node.id)?.length ?? 0) === 0,
+  );
+  if (startNodes.length === 0) {
+    throw new Error("Workflow must have at least one start node (a node with no incoming connections).");
   }
 
-  let visited = 0;
+  const visited = new Set<string>();
+  const queue = [...startNodes.map((n) => n.id)];
   while (queue.length > 0) {
-    const nodeId = queue.shift()!;
-    visited += 1;
-    for (const edge of outgoing.get(nodeId) ?? []) {
-      const next = (inDegree.get(edge.target) ?? 0) - 1;
-      inDegree.set(edge.target, next);
-      if (next === 0) {
-        queue.push(edge.target);
-      }
+    const current = queue.shift()!;
+    if (visited.has(current)) {
+      continue;
+    }
+    visited.add(current);
+    for (const edge of outgoing.get(current) ?? []) {
+      queue.push(edge.target);
     }
   }
 
-  if (visited !== workflow.nodes.length) {
-    throw new Error("Workflow must be a DAG for this MVP.");
+  if (visited.size !== workflow.nodes.length) {
+    throw new Error("Workflow has unreachable nodes. All nodes must be connected to the execution path.");
   }
 }
 
@@ -101,6 +103,7 @@ function buildPrompt(
   input: Record<string, string>,
 ) {
   const upstreamBlock = upstreamOutputs
+    .filter(({ output }) => output !== undefined)
     .map(
       ({ from, output }) =>
         `Upstream node ${from} output:\n${typeof output === "string" ? output : JSON.stringify(output, null, 2)}`,
@@ -163,26 +166,132 @@ async function executeNode(
         }
         const adapter = createChatModelAdapter(provider, agent);
         const prompt = buildPrompt(node, upstreamOutputs, context.input);
-        const result = await adapter.generate(
-          [
-            { role: "system", content: agent.systemPrompt },
-            { role: "user", content: prompt },
-          ],
-          {
-            temperature: agent.temperature,
-            maxTokens: agent.maxTokens,
-            onDelta: async (delta) => {
-              await context.onEvent({
-                ...eventBase(context.runId, "stream_delta", node.id),
-                message: delta,
-              });
+
+        const messages: ChatMessage[] = [
+          { role: "system", content: agent.systemPrompt },
+          { role: "user", content: prompt },
+        ];
+
+        let loopCount = 0;
+        const maxToolLoops = 5;
+
+        while (loopCount < maxToolLoops) {
+          const result = await adapter.generate(
+            messages,
+            {
+              temperature: agent.temperature,
+              maxTokens: agent.maxTokens,
+              onDelta: async (delta) => {
+                await context.onEvent({
+                  ...eventBase(context.runId, "stream_delta", node.id),
+                  message: delta,
+                });
+              },
             },
-          },
-        );
-        return { output: result.text };
+          );
+
+          if (result.toolCalls && result.toolCalls.length > 0) {
+            // Append assistant response to messages
+            messages.push({
+              role: "assistant",
+              content: result.text || null,
+              tool_calls: result.toolCalls.map((tc) => ({
+                id: tc.id,
+                type: "function",
+                function: { name: tc.name, arguments: tc.arguments },
+              })),
+            });
+
+            // Execute tool calls
+            for (const tc of result.toolCalls) {
+              await context.onEvent({
+                ...eventBase(context.runId, "started", node.id),
+                message: `Executing tool ${tc.name}...`,
+              });
+
+              let toolResult = "";
+              try {
+                if (tc.name === "http_request") {
+                  const args = JSON.parse(tc.arguments) as {
+                    url: string;
+                    method: string;
+                    headers?: string;
+                    body?: string;
+                  };
+                  const res = await fetch(args.url, {
+                    method: args.method,
+                    headers: {
+                      "Content-Type": "application/json",
+                      ...(args.headers ? JSON.parse(args.headers) : {}),
+                    },
+                    body: args.method === "POST" ? args.body : undefined,
+                  });
+                  toolResult = await res.text();
+                } else if (tc.name === "delegate_to_agent") {
+                  const args = JSON.parse(tc.arguments) as {
+                    agentId: string;
+                    prompt: string;
+                  };
+                  const targetAgent = context.agentsById.get(args.agentId);
+                  if (!targetAgent) {
+                    throw new Error(`Target agent ${args.agentId} not found.`);
+                  }
+                  const targetProvider = context.providersById.get(targetAgent.providerId);
+                  if (!targetProvider) {
+                    throw new Error(`Provider for target agent ${args.agentId} not found.`);
+                  }
+                  const targetAdapter = createChatModelAdapter(targetProvider, targetAgent);
+
+                  // Stream status update to UI
+                  await context.onEvent({
+                    ...eventBase(context.runId, "started", node.id),
+                    message: `Delegating to agent ${targetAgent.name}: "${args.prompt}"`,
+                  });
+
+                  const res = await targetAdapter.generate(
+                    [
+                      { role: "system", content: targetAgent.systemPrompt },
+                      { role: "user", content: args.prompt },
+                    ],
+                    {
+                      temperature: targetAgent.temperature,
+                      maxTokens: targetAgent.maxTokens,
+                    },
+                  );
+                  toolResult = res.text;
+                } else {
+                  throw new Error(`Unknown tool: ${tc.name}`);
+                }
+              } catch (err) {
+                toolResult = `Error: ${err instanceof Error ? err.message : String(err)}`;
+              }
+
+              await context.onEvent({
+                ...eventBase(context.runId, "completed", node.id),
+                message: `Tool ${tc.name} completed.`,
+              });
+
+              messages.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                name: tc.name,
+                content: toolResult,
+              });
+            }
+
+            loopCount++;
+          } else {
+            return { output: result.text };
+          }
+        }
+
+        throw new Error(`Agent Node exceeded maximum tool calling loops (${maxToolLoops})`);
       }
       case "router": {
-        const rawInput = upstreamOutputs.map((item) => item.output).join("\n");
+        const rawInput = upstreamOutputs
+          .filter(({ output }) => output !== undefined)
+          .map((item) => item.output)
+          .join("\n");
         try {
           const parsed = JSON.parse(String(rawInput)) as { route?: string };
           return { output: parsed, route: parsed.route ?? node.data.defaultRoute };
@@ -197,7 +306,11 @@ async function executeNode(
         const body = node.data.bodyTemplate
           ? interpolate(
               node.data.bodyTemplate,
-              Object.fromEntries(upstreamOutputs.map((item) => [item.from, item.output])),
+              Object.fromEntries(
+                upstreamOutputs
+                  .filter(({ output }) => output !== undefined)
+                  .map((item) => [item.from, item.output]),
+              ),
             )
           : undefined;
         const response = await fetch(node.data.url, {
@@ -216,12 +329,164 @@ async function executeNode(
       }
       case "output": {
         const payload = upstreamOutputs
+          .filter(({ output }) => output !== undefined)
           .map(({ from, output }) => `## ${from}\n${typeof output === "string" ? output : JSON.stringify(output, null, 2)}`)
           .join("\n\n");
         const output = node.data.template
           ? `${node.data.template}\n\n${payload}`
           : payload;
         return { output };
+      }
+      case "code": {
+        const inputVariables = Object.fromEntries(
+          upstreamOutputs
+            .filter(({ output }) => output !== undefined)
+            .map((item) => [item.from, item.output]),
+        );
+
+        const sandbox = {
+          inputs: inputVariables,
+          globalInputs: context.input,
+          console: {
+            log: (...args: unknown[]) => console.log("[code node console]:", ...args),
+          },
+        };
+
+        const scriptCode = `(async () => {
+          ${node.data.code}
+        })()`;
+        
+        try {
+          const result = await vm.runInNewContext(scriptCode, sandbox, { timeout: 5000 });
+          return { output: result };
+        } catch (err) {
+          throw new Error(`Code execution error: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      case "group_chat": {
+        const inputVariables = Object.fromEntries(
+          upstreamOutputs
+            .filter(({ output }) => output !== undefined)
+            .map((item) => [item.from, item.output]),
+        );
+
+        const initialPrompt = interpolate(node.data.prompt, {
+          input: context.input.user_goal ?? "",
+          ...inputVariables,
+        });
+
+        const participantIds = node.data.agentProfileIds;
+        if (!participantIds || participantIds.length === 0) {
+          throw new Error("Group Chat node requires at least one participant agent.");
+        }
+
+        const participants = participantIds
+          .map((id) => context.agentsById.get(id))
+          .filter(Boolean) as AgentProfile[];
+
+        if (participants.length === 0) {
+          throw new Error("None of the participant agent profiles were found.");
+        }
+
+        const chatHistory: { sender: string; content: string }[] = [
+          { sender: "User", content: initialPrompt },
+        ];
+
+        await context.onEvent({
+          ...eventBase(context.runId, "stream_delta", node.id),
+          message: `[System]: Starting Group Chat conversation...\nTopic: ${initialPrompt}\n\n`,
+        });
+
+        let currentTurn = 0;
+        const maxTurns = node.data.maxTurns || 5;
+        const terminationWord = node.data.terminationCondition || "TERMINATE";
+        let lastResponse = "";
+
+        while (currentTurn < maxTurns) {
+          // Select next speaker
+          let chosenAgent = participants[currentTurn % participants.length];
+
+          if (node.data.speakerSelection === "auto" && participants.length > 1) {
+            const supervisor = participants[0];
+            const supervisorProvider = context.providersById.get(supervisor.providerId);
+            if (supervisorProvider) {
+              const supervisorAdapter = createChatModelAdapter(supervisorProvider, supervisor);
+              const historyText = chatHistory
+                .map((msg) => `${msg.sender}: ${msg.content}`)
+                .join("\n");
+              const selectionPrompt = `Given this group chat history:\n${historyText}\n\nChoose the next speaker from this list: [${participants.map(p => p.name).join(", ")}]. Output ONLY the exact name of the selected agent.`;
+              try {
+                const choiceRes = await supervisorAdapter.generate(
+                  [
+                    { role: "system", content: "You are a group chat moderator. Select the next speaker name." },
+                    { role: "user", content: selectionPrompt }
+                  ],
+                  { temperature: 0.1, maxTokens: 10 }
+                );
+                const chosenName = choiceRes.text.trim();
+                const matched = participants.find(p => p.name.toLowerCase() === chosenName.toLowerCase());
+                if (matched) {
+                  chosenAgent = matched;
+                }
+              } catch (e) {
+                // Fallback to round-robin on error
+              }
+            }
+          }
+
+          const provider = context.providersById.get(chosenAgent.providerId);
+          if (!provider) {
+            throw new Error(`Provider not found for agent ${chosenAgent.name}`);
+          }
+
+          const adapter = createChatModelAdapter(provider, chosenAgent);
+          const historyText = chatHistory
+            .map((msg) => `${msg.sender}: ${msg.content}`)
+            .join("\n\n");
+
+          const prompt = `You are participating in a multi-agent group chat.\n\nYour profile:\n- Name: ${chosenAgent.name}\n- Instructions: ${chosenAgent.systemPrompt}\n\nConversation history:\n${historyText}\n\nFormulate your next response. Speak directly and naturally. Do NOT prefix your response with your name.`;
+
+          await context.onEvent({
+            ...eventBase(context.runId, "stream_delta", node.id),
+            message: `\n[${chosenAgent.name}]: `,
+          });
+
+          const result = await adapter.generate(
+            [
+              { role: "system", content: chosenAgent.systemPrompt },
+              { role: "user", content: prompt }
+            ],
+            {
+              temperature: chosenAgent.temperature,
+              maxTokens: chosenAgent.maxTokens,
+              onDelta: async (delta) => {
+                await context.onEvent({
+                  ...eventBase(context.runId, "stream_delta", node.id),
+                  message: delta,
+                });
+              },
+            }
+          );
+
+          lastResponse = result.text;
+          chatHistory.push({ sender: chosenAgent.name, content: lastResponse });
+
+          if (lastResponse.toUpperCase().includes(terminationWord.toUpperCase())) {
+            await context.onEvent({
+              ...eventBase(context.runId, "stream_delta", node.id),
+              message: `\n\n[System]: Termination condition reached ("${terminationWord}"). Ending conversation.`,
+            });
+            break;
+          }
+
+          currentTurn++;
+        }
+
+        const finalTranscript = chatHistory
+          .map((msg) => `${msg.sender}: ${msg.content}`)
+          .join("\n\n");
+
+        return { output: finalTranscript };
       }
     }
   } catch (error) {
@@ -234,17 +499,20 @@ async function executeNode(
 export async function executeWorkflow(
   dependencies: ExecutionDependencies,
 ): Promise<RunRecord> {
-  validateDag(dependencies.workflow);
+  validateGraph(dependencies.workflow);
 
   const { nodesById, incoming, outgoing } = buildMaps(dependencies.workflow);
   const runNodes = new Map<string, RunNodeState>(
-    dependencies.workflow.nodes.map((node) => [
-      node.id,
-      {
-        nodeId: node.id,
-        status: "idle",
-      },
-    ]),
+    dependencies.workflow.nodes.map((node) => {
+      const prev = dependencies.previousNodes?.find((n) => n.nodeId === node.id);
+      return [
+        node.id,
+        prev || {
+          nodeId: node.id,
+          status: "idle",
+        },
+      ];
+    }),
   );
 
   const context: ExecutionContext = {
@@ -263,40 +531,132 @@ export async function executeWorkflow(
     runId: dependencies.runId,
   };
 
-  const startNode = dependencies.workflow.nodes.find(
+  // Restore state if resuming
+  const outputs = dependencies.suspendedState
+    ? new Map(Object.entries(dependencies.suspendedState.outputs))
+    : new Map<string, unknown>();
+
+  // Restore context outputs
+  for (const [nodeId, output] of outputs.entries()) {
+    context.outputs.set(nodeId, output);
+  }
+
+  const executionCounts = dependencies.suspendedState
+    ? new Map(Object.entries(dependencies.suspendedState.executionCounts).map(([k, v]) => [k, Number(v)]))
+    : new Map<string, number>();
+
+  const routeSelections = dependencies.suspendedState
+    ? new Map(Object.entries(dependencies.suspendedState.routeSelections))
+    : new Map<string, string>();
+
+  const startNodes = dependencies.workflow.nodes.filter(
     (node) => (incoming.get(node.id)?.length ?? 0) === 0,
   );
-  if (!startNode) {
-    throw new Error("Workflow has no start node.");
-  }
 
-  const remainingDeps = new Map<string, number>();
-  const ready = new Set<string>();
-  for (const node of dependencies.workflow.nodes) {
-    const count = incoming.get(node.id)?.length ?? 0;
-    remainingDeps.set(node.id, count);
-    if (count === 0) {
-      ready.add(node.id);
-    }
-  }
+  const ready = dependencies.suspendedState
+    ? new Set<string>(dependencies.suspendedState.readyNodeIds)
+    : new Set<string>(startNodes.map((node) => node.id));
 
-  const routeSelections = new Map<string, string>();
+  const approvedNodeIds = new Set<string>([
+    ...(dependencies.suspendedState?.approvedNodeIds ?? []),
+    ...(dependencies.approvedNodeIds ?? []),
+  ]);
+
   let failed = false;
+  let paused = false;
   let finalOutput: unknown;
+  let totalExecutions = Array.from(executionCounts.values()).reduce((a, b) => a + b, 0);
+  const maxTotalExecutions = 50;
+  const maxExecutionsPerNode = 15;
 
-  while (ready.size > 0 && !failed) {
+  while (ready.size > 0 && !failed && !paused) {
     const batch = Array.from(ready);
     ready.clear();
 
+    // Check Human-in-the-Loop approval interrupt
+    const nodesRequiringApproval = batch.filter((nodeId) => {
+      const node = nodesById.get(nodeId);
+      return node?.requireApproval && !approvedNodeIds.has(nodeId);
+    });
+
+    if (nodesRequiringApproval.length > 0) {
+      paused = true;
+      // Re-add the batch back to ready so they execute on resume
+      for (const nodeId of batch) {
+        ready.add(nodeId);
+      }
+
+      // Prepare suspended state
+      const suspendedState: SuspendedState = {
+        readyNodeIds: Array.from(ready),
+        outputs: Object.fromEntries(outputs.entries()),
+        executionCounts: Object.fromEntries(executionCounts.entries()),
+        routeSelections: Object.fromEntries(routeSelections.entries()),
+        approvedNodeIds: Array.from(approvedNodeIds),
+      };
+
+      // Emit paused event
+      for (const nodeId of nodesRequiringApproval) {
+        const node = nodesById.get(nodeId)!;
+        await dependencies.onEvent({
+          ...eventBase(dependencies.runId, "paused", nodeId),
+          message: `${node.label} paused: waiting for human approval`,
+        });
+      }
+      break;
+    }
+
+    // Check loop guards and queue status
+    for (const nodeId of batch) {
+      if (totalExecutions >= maxTotalExecutions) {
+        failed = true;
+        const msg = `Loop limit exceeded: run reached maximum total executions (${maxTotalExecutions}).`;
+        const state = runNodes.get(nodeId)!;
+        state.status = "failed";
+        state.error = msg;
+        state.completedAt = now();
+        await dependencies.onEvent({
+          ...eventBase(dependencies.runId, "failed", nodeId),
+          message: msg,
+        });
+        break;
+      }
+
+      const nodeCount = (executionCounts.get(nodeId) ?? 0) + 1;
+      if (nodeCount > maxExecutionsPerNode) {
+        failed = true;
+        const msg = `Loop limit exceeded: node '${nodeId}' exceeded maximum execution limit of ${maxExecutionsPerNode}.`;
+        const state = runNodes.get(nodeId)!;
+        state.status = "failed";
+        state.error = msg;
+        state.completedAt = now();
+        await dependencies.onEvent({
+          ...eventBase(dependencies.runId, "failed", nodeId),
+          message: msg,
+        });
+        break;
+      }
+
+      executionCounts.set(nodeId, nodeCount);
+      totalExecutions++;
+
+      const state = runNodes.get(nodeId)!;
+      state.status = "queued";
+      await dependencies.onEvent({
+        ...eventBase(dependencies.runId, "queued", nodeId),
+        message: `${nodesById.get(nodeId)!.label} queued`,
+      });
+    }
+
+    if (failed) {
+      break;
+    }
+
+    // Execute batch
     await Promise.all(
       batch.map(async (nodeId) => {
         const node = nodesById.get(nodeId)!;
         const state = runNodes.get(nodeId)!;
-        state.status = "queued";
-        await dependencies.onEvent({
-          ...eventBase(dependencies.runId, "queued", nodeId),
-          message: `${node.label} queued`,
-        });
 
         const result = await executeNode(node, context);
 
@@ -316,6 +676,7 @@ export async function executeWorkflow(
         state.output = result.output;
         state.completedAt = now();
         context.outputs.set(nodeId, result.output);
+        outputs.set(nodeId, result.output); // Sync with local outputs map
         if (node.type === "output") {
           finalOutput = result.output;
         }
@@ -329,6 +690,7 @@ export async function executeWorkflow(
           output: result.output,
         });
 
+        // Trigger downstream nodes
         for (const edge of outgoing.get(nodeId) ?? []) {
           if (node.type === "router") {
             const route = routeSelections.get(node.id);
@@ -336,27 +698,40 @@ export async function executeWorkflow(
               continue;
             }
           }
-
-          const next = (remainingDeps.get(edge.target) ?? 1) - 1;
-          remainingDeps.set(edge.target, next);
-          if (next === 0) {
-            ready.add(edge.target);
-          }
+          ready.add(edge.target);
         }
       }),
     );
   }
 
+  // Determine final run status
+  let runStatus: RunRecord["status"] = "completed";
+  if (failed) {
+    runStatus = "failed";
+  } else if (paused) {
+    runStatus = "paused";
+  }
+
+  // Get suspendedState if paused
+  const suspendedState = paused ? {
+    readyNodeIds: Array.from(ready),
+    outputs: Object.fromEntries(outputs.entries()),
+    executionCounts: Object.fromEntries(executionCounts.entries()),
+    routeSelections: Object.fromEntries(routeSelections.entries()),
+    approvedNodeIds: Array.from(approvedNodeIds),
+  } : undefined;
+
   const run: RunRecord = {
     id: dependencies.runId,
     workflowId: dependencies.workflow.id,
     workflowName: dependencies.workflow.name,
-    status: failed ? "failed" : "completed",
+    status: runStatus,
     input: dependencies.input,
     output: finalOutput,
-    startedAt: now(),
-    completedAt: now(),
+    startedAt: dependencies.suspendedState?.startedAt || now(),
+    completedAt: runStatus === "completed" || runStatus === "failed" ? now() : undefined,
     nodes: Array.from(runNodes.values()),
+    suspendedState,
   };
 
   return run;

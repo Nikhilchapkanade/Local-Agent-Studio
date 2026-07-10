@@ -684,6 +684,34 @@ export function StudioShell() {
           },
         };
         break;
+      case "code":
+        nextNode = {
+          id,
+          type: "code",
+          label: "Code Execution",
+          description: "Execute sandboxed JavaScript",
+          position: { x: 500, y: 380 },
+          data: {
+            code: "// Write JS code here\n// Access inputs using the 'inputs' variable\n// e.g. return inputs['upstream-node-id'] + 1;\nreturn '';",
+          },
+        };
+        break;
+      case "group_chat":
+        nextNode = {
+          id,
+          type: "group_chat",
+          label: "Group Chat",
+          description: "Conversational Multi-Agent Group Chat",
+          position: { x: 500, y: 380 },
+          data: {
+            agentProfileIds: [],
+            maxTurns: 5,
+            terminationCondition: "TERMINATE",
+            speakerSelection: "round_robin",
+            prompt: "Discuss the topic: {{input}}",
+          },
+        };
+        break;
     }
 
     updateSnapshot((current) => ({
@@ -791,6 +819,37 @@ export function StudioShell() {
     await loadStudioRef.current();
   }
 
+  function subscribeToRunSse(runId: string) {
+    const eventSource = new EventSource(`/api/runs/${runId}/events`);
+    eventSource.onmessage = (message) => {
+      const event = JSON.parse(message.data) as RunEvent | { type: "ready" };
+      if ("runId" in event) {
+        setEvents((current) => appendTraceEvent(current, event));
+        if (event.nodeId) {
+          const nodeId = event.nodeId;
+          setNodeStatuses((current) => ({
+            ...current,
+            [nodeId]:
+              event.type === "queued"
+                ? "queued"
+                : event.type === "started"
+                  ? "running"
+                  : event.type === "completed"
+                    ? "completed"
+                    : event.type === "failed"
+                      ? "failed"
+                      : current[nodeId] ?? "running",
+          }));
+        }
+      }
+    };
+    eventSource.onerror = () => {
+      eventSource.close();
+      void loadStudioRef.current();
+    };
+    return eventSource;
+  }
+
   async function startRun() {
     if (!workflow) {
       return;
@@ -813,33 +872,9 @@ export function StudioShell() {
       const run = (await response.json()) as RunRecord;
       setSelectedRun(run);
       setRuns((current) => [run, ...current]);
-
-      const eventSource = new EventSource(`/api/runs/${run.id}/events`);
-      eventSource.onmessage = (message) => {
-        const event = JSON.parse(message.data) as RunEvent | { type: "ready" };
-        if ("runId" in event) {
-          setEvents((current) => appendTraceEvent(current, event));
-          if (event.nodeId) {
-            const nodeId = event.nodeId;
-            setNodeStatuses((current) => ({
-              ...current,
-              [nodeId]:
-                event.type === "queued"
-                  ? "queued"
-                  : event.type === "started"
-                    ? "running"
-                    : event.type === "completed"
-                      ? "completed"
-                      : event.type === "failed"
-                        ? "failed"
-                        : current[nodeId] ?? "running",
-            }));
-          }
-        }
-      };
-      eventSource.onerror = () => {
-        eventSource.close();
-        void loadStudioRef.current();
+      subscribeToRunSse(run.id);
+    });
+  };
       };
     });
   }
@@ -1304,7 +1339,7 @@ export function StudioShell() {
             <div className="grid min-h-0 flex-1 grid-cols-[1fr_360px] gap-4">
               <section className={cn("relative min-h-[760px] overflow-hidden rounded-[30px] border shadow-[0_40px_80px_rgba(0,0,0,0.18)]", theme === "dark" ? "border-white/8 bg-[#090912]/95" : "border-slate-200 bg-white/90")}>
                 <div className="absolute left-4 top-4 z-10 flex gap-2">
-                  {(["input", "router", "http_tool", "output"] as WorkflowNode["type"][]).map(
+                  {(["input", "router", "http_tool", "output", "code", "group_chat"] as WorkflowNode["type"][]).map(
                     (type) => (
                       <button
                         key={type}
@@ -1481,6 +1516,66 @@ export function StudioShell() {
                           className={cn("mt-2 w-full rounded-2xl border px-4 py-3 text-sm outline-none", inputClass(theme))}
                         />
                       </div>
+
+                      <div className="flex items-center gap-3 py-1">
+                        <input
+                          type="checkbox"
+                          id="requireApproval"
+                          checked={selectedNode.requireApproval || false}
+                          onChange={(event) => {
+                            setNodes((current) =>
+                              current.map((node) =>
+                                node.id === selectedNodeId
+                                  ? {
+                                      ...node,
+                                      data: { ...node.data, requireApproval: event.target.checked },
+                                    }
+                                  : node,
+                              ),
+                            );
+                            updateSelectedNode((node) => ({
+                              ...node,
+                              requireApproval: event.target.checked,
+                            }));
+                          }}
+                          className="h-4.5 w-4.5 rounded-lg border-slate-300 text-slate-900 focus:ring-slate-900"
+                        />
+                        <label htmlFor="requireApproval" className={cn("text-sm font-medium select-none cursor-pointer", theme === "dark" ? "text-white/80" : "text-slate-700")}>
+                          Require human approval
+                        </label>
+                      </div>
+
+                      {selectedRun && (selectedRun.status === "completed" || selectedRun.status === "failed" || selectedRun.status === "paused") ? (
+                        <div className="pt-2 border-t border-slate-200 dark:border-white/10 mt-2">
+                          <button
+                            onClick={async () => {
+                              try {
+                                await saveWorkflow();
+                                const response = await fetch(`/api/runs/${selectedRun.id}/fork`, {
+                                  method: "POST",
+                                  headers: { "Content-Type": "application/json" },
+                                  body: JSON.stringify({ nodeId: selectedNode.id }),
+                                });
+                                const newRun = (await response.json()) as RunRecord;
+                                setSelectedRun(newRun);
+                                setRuns((current) => [newRun, ...current]);
+                                setEvents([]);
+                                setNodeStatuses({});
+                                subscribeToRunSse(newRun.id);
+                              } catch (err) {
+                                console.error(err);
+                              }
+                            }}
+                            className="w-full flex items-center justify-center gap-2 rounded-2xl bg-indigo-500 hover:bg-indigo-600 px-4 py-3 text-sm font-medium text-white transition active:scale-95 cursor-pointer"
+                          >
+                            <Play className="h-4 w-4 fill-white" />
+                            Fork & Resume from here
+                          </button>
+                          <div className={cn("mt-2 text-[10px] leading-4 text-center", mutedClass(theme))}>
+                            Creates a new run using cached outputs for upstream nodes and re-running this node and downstream.
+                          </div>
+                        </div>
+                      ) : null}
 
                       {selectedNode.type === "agent" ? (
                         <>
@@ -1730,20 +1825,157 @@ export function StudioShell() {
                       {selectedNode.type === "output" ? (
                         <div>
                           <label className={cn("text-xs uppercase tracking-[0.25em]", subtleClass(theme))}>
-                            Template
+                            Output Template
                           </label>
                           <textarea
-                            rows={5}
+                            rows={8}
                             value={selectedNode.data.template}
-                            onChange={(event) =>
+                            onChange={(event) => {
                               updateSelectedNode((node) =>
                                 node.type === "output"
                                   ? { ...node, data: { ...node.data, template: event.target.value } }
                                   : node,
-                              )
-                            }
+                              );
+                            }}
                             className={cn("mt-2 w-full rounded-2xl border px-4 py-3 text-sm outline-none", inputClass(theme))}
                           />
+                        </div>
+                      ) : null}
+
+                      {selectedNode.type === "code" ? (
+                        <div>
+                          <label className={cn("text-xs uppercase tracking-[0.25em]", subtleClass(theme))}>
+                            JavaScript Code
+                          </label>
+                          <textarea
+                            rows={15}
+                            value={selectedNode.data.code}
+                            onChange={(event) => {
+                              updateSelectedNode((node) =>
+                                node.type === "code"
+                                  ? { ...node, data: { ...node.data, code: event.target.value } }
+                                  : node,
+                              );
+                            }}
+                            className={cn("mt-2 w-full font-mono rounded-2xl border px-4 py-3 text-sm outline-none", inputClass(theme))}
+                          />
+                        </div>
+                      ) : null}
+
+                      {selectedNode.type === "group_chat" ? (
+                        <div className="space-y-4">
+                          <div>
+                            <label className={cn("text-xs uppercase tracking-[0.25em]", subtleClass(theme))}>
+                              Participant Agents
+                            </label>
+                            <div className="mt-2 space-y-1.5 max-h-40 overflow-y-auto pr-1">
+                              {snapshot?.agents.map((agent) => {
+                                const isChecked = (selectedNode.data.agentProfileIds || []).includes(agent.id);
+                                return (
+                                  <label key={agent.id} className="flex items-center gap-2 text-sm select-none cursor-pointer">
+                                    <input
+                                      type="checkbox"
+                                      checked={isChecked}
+                                      onChange={(event) => {
+                                        const currentIds = selectedNode.data.agentProfileIds || [];
+                                        const nextIds = event.target.checked
+                                          ? [...currentIds, agent.id]
+                                          : currentIds.filter((id) => id !== agent.id);
+                                        updateSelectedNode((node) =>
+                                          node.type === "group_chat"
+                                            ? { ...node, data: { ...node.data, agentProfileIds: nextIds } }
+                                            : node,
+                                        );
+                                      }}
+                                      className="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                                    />
+                                    <span className={theme === "dark" ? "text-white/80" : "text-slate-700"}>
+                                      {agent.name}
+                                    </span>
+                                  </label>
+                                );
+                              })}
+                            </div>
+                          </div>
+
+                          <div className="grid grid-cols-2 gap-3">
+                            <div>
+                              <label className={cn("text-xs uppercase tracking-[0.25em]", subtleClass(theme))}>
+                                Max Turns
+                              </label>
+                              <input
+                                type="number"
+                                min={1}
+                                max={20}
+                                value={selectedNode.data.maxTurns || 5}
+                                onChange={(event) => {
+                                  const val = parseInt(event.target.value) || 5;
+                                  updateSelectedNode((node) =>
+                                    node.type === "group_chat"
+                                      ? { ...node, data: { ...node.data, maxTurns: val } }
+                                      : node,
+                                  );
+                                }}
+                                className={cn("mt-2 w-full rounded-2xl border px-4 py-2.5 text-sm outline-none", inputClass(theme))}
+                              />
+                            </div>
+                            <div>
+                              <label className={cn("text-xs uppercase tracking-[0.25em]", subtleClass(theme))}>
+                                Speaker Selection
+                              </label>
+                              <select
+                                value={selectedNode.data.speakerSelection || "round_robin"}
+                                onChange={(event) => {
+                                  const val = event.target.value as "round_robin" | "auto";
+                                  updateSelectedNode((node) =>
+                                    node.type === "group_chat"
+                                      ? { ...node, data: { ...node.data, speakerSelection: val } }
+                                      : node,
+                                  );
+                                }}
+                                className={cn("mt-2 w-full rounded-2xl border px-4 py-2.5 text-sm outline-none", inputClass(theme))}
+                              >
+                                <option value="round_robin">Round Robin</option>
+                                <option value="auto">Auto Moderator</option>
+                              </select>
+                            </div>
+                          </div>
+
+                          <div>
+                            <label className={cn("text-xs uppercase tracking-[0.25em]", subtleClass(theme))}>
+                              Termination Keyword
+                            </label>
+                            <input
+                              type="text"
+                              value={selectedNode.data.terminationCondition || "TERMINATE"}
+                              onChange={(event) => {
+                                updateSelectedNode((node) =>
+                                  node.type === "group_chat"
+                                    ? { ...node, data: { ...node.data, terminationCondition: event.target.value } }
+                                    : node,
+                                );
+                              }}
+                              className={cn("mt-2 w-full rounded-2xl border px-4 py-2.5 text-sm outline-none", inputClass(theme))}
+                            />
+                          </div>
+
+                          <div>
+                            <label className={cn("text-xs uppercase tracking-[0.25em]", subtleClass(theme))}>
+                              Initial Topic / Prompt
+                            </label>
+                            <textarea
+                              rows={3}
+                              value={selectedNode.data.prompt || ""}
+                              onChange={(event) => {
+                                updateSelectedNode((node) =>
+                                  node.type === "group_chat"
+                                    ? { ...node, data: { ...node.data, prompt: event.target.value } }
+                                    : node,
+                                );
+                              }}
+                              className={cn("mt-2 w-full rounded-2xl border px-4 py-3 text-sm outline-none", inputClass(theme))}
+                            />
+                          </div>
                         </div>
                       ) : null}
                     </div>
@@ -1767,13 +1999,63 @@ export function StudioShell() {
                             ? "bg-emerald-500/10 text-emerald-200"
                             : selectedRun.status === "failed"
                               ? "bg-rose-500/10 text-rose-200"
-                              : "bg-indigo-500/10 text-indigo-200",
+                              : selectedRun.status === "paused"
+                                ? "bg-amber-500/10 text-amber-200 animate-pulse font-semibold"
+                                : "bg-indigo-500/10 text-indigo-200",
                         )}
                       >
                         {selectedRun.status}
                       </div>
                     ) : null}
                   </div>
+
+                  {selectedRun && selectedRun.status === "paused" ? (
+                    <div className={cn(
+                      "mt-4 rounded-2xl border p-4 flex flex-col gap-3 backdrop-blur-md",
+                      theme === "dark" ? "border-amber-500/20 bg-amber-500/10" : "border-amber-200 bg-amber-50"
+                    )}>
+                      <div className="flex items-center gap-2">
+                        <span className="relative flex h-2 w-2">
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                          <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500"></span>
+                        </span>
+                        <div className={cn("text-xs font-semibold uppercase tracking-wider text-amber-500")}>
+                          Awaiting Human Approval
+                        </div>
+                      </div>
+                      <p className={cn("text-xs leading-5", theme === "dark" ? "text-white/70" : "text-slate-600")}>
+                        This run requires human intervention before executing the next node. Click below to approve and resume.
+                      </p>
+                      <div className="flex gap-2 mt-1">
+                        <button
+                          onClick={async () => {
+                            const pausedNodeId = selectedRun.suspendedState?.readyNodeIds.find(
+                              (id) => workflow?.nodes.find((n) => n.id === id)?.requireApproval
+                            ) || selectedRun.suspendedState?.readyNodeIds[0];
+
+                            if (!pausedNodeId) return;
+
+                            try {
+                              const res = await fetch(`/api/runs/${selectedRun.id}/resume`, {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({ approvedNodeId: pausedNodeId }),
+                              });
+                              const updated = await res.json();
+                              setSelectedRun(updated);
+                              subscribeToRunSse(updated.id);
+                            } catch (err) {
+                              console.error(err);
+                            }
+                          }}
+                          className="rounded-xl bg-amber-500 px-4.5 py-2 text-xs font-semibold text-white hover:bg-amber-600 active:scale-95 transition cursor-pointer"
+                        >
+                          Approve & Resume
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+
                   <div className="mt-4 space-y-3 overflow-y-auto pr-1">
                     {events.length === 0 ? (
                       <div

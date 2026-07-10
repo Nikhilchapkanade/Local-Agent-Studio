@@ -66,6 +66,7 @@ const nodeBaseSchema = z.object({
   label: z.string(),
   description: z.string().default(""),
   position: flowPositionSchema,
+  requireApproval: z.boolean().optional().default(false),
 });
 
 export const inputNodeSchema = nodeBaseSchema.extend({
@@ -109,12 +110,32 @@ export const outputNodeSchema = nodeBaseSchema.extend({
   }),
 });
 
+export const codeNodeSchema = nodeBaseSchema.extend({
+  type: z.literal("code"),
+  data: z.object({
+    code: z.string().default("// Write JS code here\n// Access inputs using the 'inputs' variable\n// e.g. return inputs['upstream-node-id'] + 1;\nreturn '';"),
+  }),
+});
+
+export const groupChatNodeSchema = nodeBaseSchema.extend({
+  type: z.literal("group_chat"),
+  data: z.object({
+    agentProfileIds: z.array(z.string()).default([]),
+    maxTurns: z.number().int().positive().default(5),
+    terminationCondition: z.string().default("TERMINATE"),
+    speakerSelection: z.enum(["auto", "round_robin"]).default("round_robin"),
+    prompt: z.string().default("Discuss the topic: {{input}}"),
+  }),
+});
+
 export const workflowNodeSchema = z.discriminatedUnion("type", [
   inputNodeSchema,
   agentNodeSchema,
   routerNodeSchema,
   httpToolNodeSchema,
   outputNodeSchema,
+  codeNodeSchema,
+  groupChatNodeSchema,
 ]);
 
 export type WorkflowNode = z.infer<typeof workflowNodeSchema>;
@@ -155,6 +176,7 @@ export const runStatusSchema = z.enum([
   "running",
   "completed",
   "failed",
+  "paused",
 ]);
 
 export const runEventSchema = z.discriminatedUnion("type", [
@@ -199,6 +221,14 @@ export const runEventSchema = z.discriminatedUnion("type", [
     message: z.string(),
     timestamp: z.string(),
   }),
+  z.object({
+    id: z.string(),
+    runId: z.string(),
+    nodeId: z.string().optional(),
+    type: z.literal("paused"),
+    message: z.string(),
+    timestamp: z.string(),
+  }),
 ]);
 
 export type RunEvent = z.infer<typeof runEventSchema>;
@@ -214,6 +244,16 @@ export const runNodeSchema = z.object({
 
 export type RunNodeState = z.infer<typeof runNodeSchema>;
 
+export const suspendedStateSchema = z.object({
+  readyNodeIds: z.array(z.string()),
+  outputs: z.record(z.string(), z.unknown()),
+  executionCounts: z.record(z.string(), z.number()),
+  routeSelections: z.record(z.string(), z.string()),
+  approvedNodeIds: z.array(z.string()).default([]),
+});
+
+export type SuspendedState = z.infer<typeof suspendedStateSchema>;
+
 export const runRecordSchema = z.object({
   id: z.string(),
   workflowId: z.string(),
@@ -224,6 +264,7 @@ export const runRecordSchema = z.object({
   startedAt: z.string(),
   completedAt: z.string().optional(),
   nodes: z.array(runNodeSchema).default([]),
+  suspendedState: suspendedStateSchema.optional(),
 });
 
 export type RunRecord = z.infer<typeof runRecordSchema>;
