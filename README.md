@@ -506,37 +506,3 @@ npm test
 npm run build
 ```
 
-### Recommended Contribution Flow
-
-1. Open or pick a GitHub issue.
-2. Create a focused branch.
-3. Make one logically grouped change.
-4. Verify with lint, tests, and build.
-5. Open a PR with screenshots or short recordings for UI changes.
-
-## Good First Contribution Areas
-
-- improve run observability and timing detail
-- add workflow validation UX
-- build richer HTTP tool templates
-- improve import/export versioning
-- add onboarding and templates
-- improve node comparison and diff tooling
-- add workspace management and review gates
-
-## Roadmap Themes
-
-Tracked in GitHub issues already:
-
-- provider testing and normalized model discovery
-- snapshots and versioning
-- run controls
-- workflow input variables
-- graph guardrails
-- local secret storage
-- tool adapter SDK
-- onboarding and templates
-- AgentSkills compatibility
-- workspace-aware orchestration
-- review gates and output comparison
-- kanban-style operations board
